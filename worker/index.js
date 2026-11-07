@@ -156,6 +156,18 @@ function pageText(html) {
   return s.trim();
 }
 function slugify(t) { return t.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 70); }
+function looseJSON(raw) {   // v1.10.1 (problems flywheel 5 Nov): the model often returns "body": [ unquoted lines ]; recover title/summary/body instead of holding the draft
+  const s = String(raw || ''); const a = s.indexOf('{'), b = s.lastIndexOf('}');
+  const core = a >= 0 ? s.slice(a, b > a ? b + 1 : s.length) : s;
+  try { return JSON.parse(core); } catch (e) { }
+  const pick = k => { const m = core.match(new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"')); return m ? m[1].replace(/\\"/g, '"') : ''; };
+  const title = pick('title'), summary = pick('summary');
+  const bm = core.match(/"body"\s*:\s*\[([\s\S]*)/);
+  let body = [];
+  if (bm) body = bm[1].replace(/\]\s*\}?\s*$/, '').split(/\n+|",\s*"/).map(x => x.trim().replace(/^[\s",\[]+|[\s",\]\}]+$/g, '').trim()).filter(x => x.length > 20);
+  if (!title || !body.length) throw new Error('not JSON');
+  return { title, summary, body };
+}
 async function draftFrom(env, cand) {
   const r = await fetch(ORIGIN + cand.path, { headers: { 'user-agent': 'cedwyn-blog/1.0' } });
   if (!r.ok) return { skip: 'page ' + r.status };
@@ -172,7 +184,7 @@ async function draftFrom(env, cand) {
   const out = await env.AI.run(MODEL, { messages: [{ role: 'system', content: sys }, { role: 'user', content: 'PAGE: ' + cand.title + '\nSOURCE:\n' + text }], max_tokens: 700, temperature: 0.2 });
   const resp = out && (out.response !== undefined ? out.response : out.result);
   const raw = typeof resp === 'object' && resp ? JSON.stringify(resp) : String(resp || '');
-  let j; try { j = typeof resp === 'object' && resp ? resp : JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)); } catch (e) { return { held: { cand, raw: raw.slice(0, 1500), why: ['model reply was not JSON'] } }; }
+  let j; try { j = typeof resp === 'object' && resp ? resp : looseJSON(raw); } catch (e) { return { held: { cand, raw: raw.slice(0, 1500), why: ['model reply was not JSON'] } }; }
   const body = Array.isArray(j.body) ? j.body.map(String).filter(Boolean).slice(0, 4) : [String(j.body || '')];
   const now = new Date().toISOString();
   const post = { slug: slugify(String(j.title || cand.title)) + '-' + now.slice(0, 10), title: String(j.title || '').slice(0, 90), summary: String(j.summary || '').slice(0, 240), body,
@@ -183,7 +195,7 @@ async function draftFrom(env, cand) {
       { role: 'assistant', content: JSON.stringify({ title: post.title, summary: post.summary, body: post.body }) },
       { role: 'user', content: 'These parts are not in SOURCE: ' + why.join('; ') + '. Rewrite using only sentences and words taken from SOURCE. JSON only.' }], max_tokens: 700, temperature: 0.1 });
     const r2 = out2 && (out2.response !== undefined ? out2.response : out2.result);
-    let j2 = null; try { j2 = typeof r2 === 'object' && r2 ? r2 : JSON.parse(String(r2).slice(String(r2).indexOf('{'), String(r2).lastIndexOf('}') + 1)); } catch (e) { }
+    let j2 = null; try { j2 = typeof r2 === 'object' && r2 ? r2 : looseJSON(r2); } catch (e) { }
     if (j2 && j2.title) {
       const p2 = { ...post, title: String(j2.title).slice(0, 90), summary: String(j2.summary || '').slice(0, 240), body: Array.isArray(j2.body) ? j2.body.map(String).filter(Boolean).slice(0, 4) : [String(j2.body || '')] };
       p2.slug = slugify(p2.title) + '-' + post.date.slice(0, 10);
@@ -217,6 +229,11 @@ async function autoPost(env, force) {
   let cands = CANDIDATES; try { const o = await env.BLOG.get('candidates'); if (o) cands = JSON.parse(o); } catch (e) { }
   const seedSrc = new Set(SEED.map(p => p.source));
   const order = [...cands.filter(c => !covered.includes(c.path) && !seedSrc.has(c.path)), ...cands.filter(c => !covered.includes(c.path) && seedSrc.has(c.path))];
+  if (!order.length) {   // v1.10.2 (problems flywheel 5 Nov, P-BLOG-POOL): pool exhausted -> next uncovered evidence-record page from the register (no 1547/1552, no FOI pages)
+    try { const rr = await fetch(ORIGIN + '/research/evidence/', { headers: { 'user-agent': 'cedwyn-blog/1.0' } }); const hh = await rr.text();
+      const evs = [...new Set([...hh.matchAll(/href="(\/research\/evidence\/ev-[^"#?]+\/)"/g)].map(m => m[1]))].filter(p => !covered.includes(p) && !/1547|1552|foi/i.test(p));
+      for (const p of evs.slice(0, 10)) order.push({ path: p, title: 'Evidence record ' + p.split('/')[3].slice(0, 7).toUpperCase() }); log.pool = 'evidence register'; } catch (e) { log.pool_error = String(e).slice(0, 120); }
+  }
   if (!order.length) { log.skip = 'every candidate page is covered'; await env.BLOG.put('log_last', JSON.stringify(log)); return log; }
   log.tries = [];
   for (const cand of order.slice(0, 3)) {
